@@ -783,17 +783,63 @@ export function renderCodeGraphStatus(pi: ExtensionAPI): string {
  * (and records it for the status panel). Used when the flag is off (the default)
  * but the user wants this folder indexed now.
  */
-export function runManualInit(pi: ExtensionAPI, cwd: string | undefined): void {
-  const projectPath = cwd ?? process.cwd();
+export function runManualInit(ctx: ExtensionContext): void {
+  const projectPath = ctx.cwd ?? process.cwd();
+  const ui = ctx.hasUI ? ctx.ui : undefined;
+  // A TUI glitch must never reject this fire-and-forget chain.
+  const safe = (fn: () => void): void => {
+    try {
+      fn();
+    } catch {
+      /* swallow */
+    }
+  };
+
+  // Status-bar-only start signal: persists as the in-flight indicator without
+  // adding a toast (the completion toast closes the loop). Skipped entirely in
+  // headless/print mode, where ctx.hasUI is false.
+  if (ui) safe(() => ui.setStatus("codegraph", "CodeGraph: indexing…"));
+
   ensureCodeGraphIndexOnce(projectPath)
     .then((result) => {
       lastStartupAction = result;
-      const ui = (pi as any)?.ui;
-      if (ui?.notify) {
-        ui.notify(`CodeGraph: ${result.action} (${projectPath})`, result.action === "unavailable" ? "warning" : "info");
-      }
+      if (!ui) return;
+      safe(() => {
+        switch (result.action) {
+          case "initialized":
+          case "rebuilt":
+          case "synced":
+            ui.setStatus("codegraph", `CodeGraph: ${result.action}`);
+            ui.notify(`CodeGraph: ${result.action} (${projectPath})`, "info");
+            break;
+          case "busy":
+            ui.setStatus("codegraph", "CodeGraph: index busy (run `codegraph unlock` if stuck)");
+            ui.notify(`CodeGraph: busy (${projectPath})`, "info");
+            break;
+          case "unavailable":
+            // Manual init is the explicit path: surface the install hint, not
+            // a terse "unavailable". Mirrors reportStartupAction.
+            ui.setStatus("codegraph", undefined);
+            ui.notify(
+              "CodeGraph unavailable; init aborted. Install the codegraph CLI and ensure it's on PATH (`npm i -g @colbymchenry/codegraph`).",
+              "warning",
+            );
+            break;
+          default: // skipped — already up to date
+            ui.setStatus("codegraph", undefined);
+            ui.notify(`CodeGraph: already up to date (${projectPath})`, "info");
+        }
+      });
     })
-    .catch(() => {});
+    .catch(() => {
+      // Never leave a stale "indexing…" status after a silent failure, and
+      // never re-throw out of .catch (would be an unhandled rejection).
+      if (!ui) return;
+      safe(() => {
+        ui.setStatus("codegraph", undefined);
+        ui.notify("CodeGraph: init failed", "error");
+      });
+    });
 }
 
 export default function codegraphExtension(pi: ExtensionAPI): void {
@@ -864,7 +910,7 @@ export default function codegraphExtension(pi: ExtensionAPI): void {
       // want to index a specific folder on demand. Fire-and-forget, with a
       // notify of the outcome so the user knows what happened.
       if (trimmed === "init") {
-        runManualInit(pi, ctx.cwd);
+        runManualInit(ctx);
         return;
       }
 

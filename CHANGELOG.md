@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.0.1 — 2026-06-25
+
+Bugfix release for the `/codegraph init` command.
+
+### Fixed
+- **`/codegraph init` now gives visual feedback.** Previously the command
+  was fire-and-forget with only a completion-time notify, leaving the user
+  with no indicator that indexing had started or was running. The status bar
+  now shows `CodeGraph: indexing…` for the whole duration, and the outcome
+  (initialized / rebuilt / synced / busy / skipped / unavailable) updates it
+  on completion.
+- **Fixed UI surface for manual init.** `runManualInit` reached for
+  `(pi as any)?.ui`, an untyped property that does not exist on the
+  `ExtensionAPI` surface. This was plausibly why feedback was invisible at
+  runtime. Reworked to route through `ctx.ui` / `ctx.hasUI` like the rest of
+  the extension, so headless/print mode is now correctly skipped.
+- **Unguarded UI calls can no longer crash the command.** All UI writes are
+  now wrapped in a swallow helper, so a TUI glitch can neither reject the
+  fire-and-forget chain nor cause an unhandled rejection from `.catch`.
+- **`unavailable` now surfaces the install hint** (`npm i -g
+  @colbymchenry/codegraph`) instead of a terse message, mirroring the
+  startup auto-index path — the manual path is where users most need it.
+- **Stale `indexing…` status is cleared on failure.** The previously silent
+  `.catch(() => {})` now clears the status bar and notifies `CodeGraph: init
+  failed` so a silent failure no longer leaves a hung indicator.
+
 ## 1.0.0 — 2026-06-25
 
 First release of `@estebanforge/pi-codegraph`, a fork of
