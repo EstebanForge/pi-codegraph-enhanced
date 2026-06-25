@@ -1,0 +1,61 @@
+{
+  "name": "@estebanforge/pi-codegraph-enhanced",
+  "version": "1.0.0",
+  "description": "Pi-native CodeGraph tools with startup auto-indexing. Fork of @vndv/pi-codegraph that adds automatic index init/resync on every session start: creates the index when missing, incrementally syncs drift, rebuilds on corruption, and skips cleanly when another process holds the lock or the CLI is absent. Same eight codegraph_* tools (search, node, files, callers, callees, impact, explore, status) proxying CodeGraph's MCP server, now with a cancellable, Windows-aware CLI runner and user-visible status feedback.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "codegraph",
+    "code-intelligence",
+    "code-index",
+    "auto-index",
+    "tree-sitter",
+    "call-graph",
+    "coding-agent"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "EstebanForge",
+    "email": "esteban@attitude.cl",
+    "url": "https://actitud.xyz"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EstebanForge/pi-codegraph-enhanced.git"
+  },
+  "type": "module",
+  "files": [
+    "extensions",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@colbymchenry/codegraph": "^1.0.1",
+    "@earendil-works/pi-coding-agent": "^0.79.6",
+    "@earendil-works/pi-tui": "^0.79.8",
+    "@types/node": "^22.0.0",
+    "typebox": "*",
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.7"
+  }
+}
