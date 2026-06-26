@@ -10,6 +10,13 @@ vi.mock("node:child_process", () => ({
   spawn: vi.fn(() => createMockProcess()),
 }));
 
+// Default to the real fs.promises so the 40+ existing tests keep working; the
+// stat spy is only overridden in the EACCES test via mockRejectedValueOnce.
+vi.mock("node:fs/promises", async (importActual) => {
+  const actual = await importActual<typeof import("node:fs/promises")>();
+  return { ...actual, stat: vi.fn(actual.stat) };
+});
+
 function createMockProcess(returnResult?: { content?: any[]; isError?: boolean }) {
   const child = new EventEmitter() as any;
   child.stdin = new PassThrough();
@@ -754,13 +761,13 @@ describe("/codegraph flag + status", () => {
   });
 
   it("renders the status panel with the flag checked when on (default)", async () => {
-    const { renderCodeGraphStatus, setLastStartupActionForTest } = await import("../extensions/codegraph.js");
-    setLastStartupActionForTest({ action: "synced", projectPath: "/p" });
+    const { renderCodeGraphStatus, setLastIndexActionForTest } = await import("../extensions/codegraph.js");
+    setLastIndexActionForTest({ action: "synced", projectPath: "/p", source: "startup" });
 
     const panel = renderCodeGraphStatus(fakePi(true));
 
     expect(panel).toContain("[x] codegraph-auto-index");
-    expect(panel).toContain("last startup action: synced");
+    expect(panel).toContain("last index action: startup synced (/p)");
     expect(panel).toContain("/codegraph toggle");
   });
 
@@ -771,8 +778,8 @@ describe("/codegraph flag + status", () => {
   });
 
   it("reports no startup action yet when none has run this session", async () => {
-    const { renderCodeGraphStatus, setLastStartupActionForTest } = await import("../extensions/codegraph.js");
-    setLastStartupActionForTest(undefined);
+    const { renderCodeGraphStatus, setLastIndexActionForTest } = await import("../extensions/codegraph.js");
+    setLastIndexActionForTest(undefined);
     const panel = renderCodeGraphStatus(fakePi(true));
     expect(panel).toContain("(none yet this session)");
   });
@@ -830,5 +837,213 @@ describe("auto-index flag gating in resources_discover", () => {
 
   it("runs the gate when the flag is on, even with no existing index", async () => {
     expect(await driveGate({ flag: true, indexed: false })).toBe(true);
+  });
+});
+
+describe("/codegraph sync (runManualSync)", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "cg-sync-"));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  // Injectable runner: records each argv call so tests can assert ordering
+  // (probe → status → sync) AND script responses per command. Replaces the old
+  // mockSpawnFor helper, which couldn't distinguish --version from sync -q.
+  function makeRunner(responses: Record<string, { stdout?: string; stderr?: string; code?: number }>) {
+    const calls: { args: string[] }[] = [];
+    const runner = async (args: string[]) => {
+      calls.push({ args });
+      const key = args.join(" ");
+      const resp = responses[key] ?? { code: 0 };
+      return {
+        stdout: resp.stdout ?? "",
+        stderr: resp.stderr ?? "",
+        code: resp.code ?? 0,
+        timedOut: false,
+      };
+    };
+    return { runner, calls };
+  }
+
+  // Fake ExtensionContext that records every status/notify so the
+  // fire-and-forget runManualSync chain can be asserted post-hoc. hasUI toggles
+  // headless mode.
+  function fakeCtx(hasUI = true): any {
+    const notifies: { msg: string; level: string }[] = [];
+    const statuses: { key: string; value: string | undefined }[] = [];
+    return {
+      ctx: {
+        cwd: tmpDir,
+        hasUI,
+        ui: {
+          setStatus: (key: string, value: string | undefined) => statuses.push({ key, value }),
+          notify: (msg: string, level: string) => notifies.push({ msg, level }),
+        },
+      },
+      notifies,
+      statuses,
+    };
+  }
+
+  it("notifies synced and records the action when sync exits 0", async () => {
+    const { runManualSync, setLastIndexActionForTest } = await import("../extensions/codegraph.js");
+    setLastIndexActionForTest(undefined);
+    await fs.mkdir(path.join(tmpDir, ".codegraph"));
+    const { ctx, notifies } = fakeCtx();
+    const { runner, calls } = makeRunner({
+      "status --json": { stdout: JSON.stringify({ initialized: true, pendingChanges: { added: 1 } }) },
+    });
+
+    runManualSync(ctx, runner);
+    await vi.waitFor(() =>
+      expect(notifies.some((n: { msg: string }) => n.msg.startsWith("CodeGraph: synced"))).toBe(true),
+    );
+
+    // Injectable runner proves the exact call sequence: probe → status → sync.
+    expect(calls.map((c) => c.args)).toEqual([
+      ["--version"],
+      ["status", "--json"],
+      ["sync", "-q"],
+    ]);
+  });
+
+  it("points the user at /codegraph init when no .codegraph/ exists", async () => {
+    const { runManualSync } = await import("../extensions/codegraph.js");
+    const { ctx, notifies } = fakeCtx();
+    const { runner, calls } = makeRunner({});
+
+    runManualSync(ctx, runner);
+    await vi.waitFor(() =>
+      expect(notifies.some((n: { msg: string }) => n.msg.includes("No .codegraph index") && n.msg.includes("/codegraph init"))).toBe(true),
+    );
+
+    // No status/sync call should fire when the index dir is absent.
+    expect(calls.find((c) => c.args[0] === "status" || c.args[0] === "sync")).toBeUndefined();
+  });
+
+  it("warns that codegraph is unavailable when --version fails", async () => {
+    const { runManualSync } = await import("../extensions/codegraph.js");
+    const { ctx, notifies } = fakeCtx();
+    const { runner } = makeRunner({ "--version": { stderr: "spawn codegraph ENOENT", code: -1 } });
+
+    runManualSync(ctx, runner);
+    await vi.waitFor(() =>
+      expect(notifies.some((n: { msg: string; level: string }) => n.msg.startsWith("CodeGraph unavailable") && n.level === "warning")).toBe(true),
+    );
+  });
+
+  it("reports busy (not corrupt) when sync loses the file lock", async () => {
+    const { runManualSync } = await import("../extensions/codegraph.js");
+    await fs.mkdir(path.join(tmpDir, ".codegraph"));
+    const { ctx, notifies, statuses } = fakeCtx();
+    const { runner } = makeRunner({
+      "status --json": { stdout: JSON.stringify({ initialized: true, pendingChanges: { added: 3 } }) },
+      "sync -q": { stderr: "Could not acquire file lock", code: 1 },
+    });
+
+    runManualSync(ctx, runner);
+    await vi.waitFor(() =>
+      expect(notifies.some((n: { msg: string }) => n.msg.includes("sync did not complete"))).toBe(true),
+    );
+
+    expect(statuses.some((s: { key: string; value: string | undefined }) => typeof s.value === "string" && s.value.includes("index busy"))).toBe(true);
+  });
+
+  it("surfaces corrupt/unreadable index distinctly (not busy), pointing at init", async () => {
+    // #1: a corrupt DB (status initialized:false / non-zero) must NOT be
+    // bucketed as busy with an unlock hint — it's not a lock problem.
+    const { runManualSync } = await import("../extensions/codegraph.js");
+    await fs.mkdir(path.join(tmpDir, ".codegraph"));
+    const { ctx, notifies, statuses } = fakeCtx();
+    const { runner } = makeRunner({
+      "status --json": { stderr: "database disk image is malformed", code: 1 },
+    });
+
+    runManualSync(ctx, runner);
+    await vi.waitFor(() =>
+      expect(notifies.some((n: { msg: string }) => n.msg.includes("corrupt or unreadable") && n.msg.includes("/codegraph init"))).toBe(true),
+    );
+
+    // No unlock hint, no busy status.
+    expect(notifies.some((n: { msg: string }) => n.msg.includes("unlock"))).toBe(false);
+    expect(statuses.some((s: { key: string; value: string | undefined }) => typeof s.value === "string" && s.value.includes("index busy"))).toBe(false);
+  });
+
+  it("reports a genuine sync failure distinctly from busy", async () => {
+    // #2: a non-zero sync exit that is NOT a lock conflict (e.g. disk full,
+    // crash) must surface as a failure, not as "busy" with an unlock hint.
+    const { runManualSync } = await import("../extensions/codegraph.js");
+    await fs.mkdir(path.join(tmpDir, ".codegraph"));
+    const { ctx, notifies } = fakeCtx();
+    const { runner } = makeRunner({
+      "status --json": { stdout: JSON.stringify({ initialized: true, pendingChanges: { added: 2 } }) },
+      "sync -q": { stderr: "No space left on device", code: 2 },
+    });
+
+    runManualSync(ctx, runner);
+    await vi.waitFor(() =>
+      expect(notifies.some((n: { msg: string }) => n.msg.startsWith("CodeGraph: sync failed"))).toBe(true),
+    );
+
+    expect(notifies.some((n: { msg: string }) => n.msg.includes("unlock"))).toBe(false);
+  });
+
+  it("records lastIndexAction with manual source (not overwriting startup semantics)", async () => {
+    // #3: a manual sync records source:'manual' so the status panel can tell it
+    // apart from the startup gate's record. Read via the namespace object (not
+    // destructuring) so the `export let` live binding is observed.
+    const mod = await import("../extensions/codegraph.js");
+    mod.setLastIndexActionForTest(undefined);
+    await fs.mkdir(path.join(tmpDir, ".codegraph"));
+    const { ctx } = fakeCtx();
+    const { runner } = makeRunner({
+      "status --json": { stdout: JSON.stringify({ initialized: true, pendingChanges: { added: 1 } }) },
+    });
+
+    mod.runManualSync(ctx, runner);
+    // Wait on the terminal action (not just source) so we don't match stale state
+    // from a prior test's fire-and-forget chain.
+    await vi.waitFor(() => expect(mod.lastIndexAction?.action).toBe("synced"));
+    expect(mod.lastIndexAction?.source).toBe("manual");
+  });
+
+  it("surfaces a permission error reading .codegraph/ instead of redirecting to init", async () => {
+    // #6: EACCES on the index dir must surface the real error; telling the
+    // user to run init would loop, since init would hit the same permission.
+    const { runManualSync } = await import("../extensions/codegraph.js");
+    await fs.mkdir(path.join(tmpDir, ".codegraph"));
+    const { ctx, notifies } = fakeCtx();
+    const { runner } = makeRunner({});
+
+    // Force the extension's imported `stat` to reject with EACCES (not ENOENT).
+    const eacces = new Error("permission denied");
+    (eacces as any).code = "EACCES";
+    vi.mocked(fs.stat).mockRejectedValueOnce(eacces);
+
+    runManualSync(ctx, runner);
+    await vi.waitFor(() =>
+      expect(notifies.some((n: { msg: string; level: string }) => n.msg.startsWith("Cannot read .codegraph/") && n.level === "error")).toBe(true),
+    );
+    expect(notifies.some((n: { msg: string }) => n.msg.includes("/codegraph init"))).toBe(false);
+  });
+
+  it("still records the action in headless mode (hasUI false) with no UI calls", async () => {
+    const mod = await import("../extensions/codegraph.js");
+    mod.setLastIndexActionForTest(undefined);
+    await fs.mkdir(path.join(tmpDir, ".codegraph"));
+    const { ctx, notifies, statuses } = fakeCtx(false);
+    const { runner } = makeRunner({
+      "status --json": { stdout: JSON.stringify({ initialized: true, pendingChanges: { added: 1 } }) },
+    });
+
+    mod.runManualSync(ctx, runner);
+    await vi.waitFor(() => expect(mod.lastIndexAction?.action).toBe("synced"));
+    expect(notifies).toHaveLength(0);
+    expect(statuses).toHaveLength(0);
   });
 });

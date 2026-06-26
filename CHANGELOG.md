@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.0.4 — 2026-06-26
+
+Hardening of `/codegraph sync` after peer review (six findings addressed).
+
+### Changed
+- **Distinct failure reporting in `/codegraph sync`.** A corrupt/unreadable
+  index (`status` fails / `initialized:false`) now reports a dedicated
+  "index corrupt or unreadable, run /codegraph init" message instead of being
+  mis-bucketed as "busy" with an unlock hint. Genuine sync failures (non-zero
+  exit that isn't a lock conflict) surface as "sync failed" rather than
+  "busy". Only real lock contention / timeouts report `busy`.
+- **`source` field on the recorded index action.** `lastStartupAction` is now
+  `lastIndexAction` carrying `source: "startup" | "manual"`, so a transient
+  manual-sync lock no longer overwrites a clean startup record in the status
+  panel. The panel now reads "last index action: <source> <action> (<path>)".
+  The test seam is renamed to `setLastIndexActionForTest`.
+- **Injectable runner for `runManualSync`.** Takes an optional `runner`
+  parameter like every other CLI entry point, so tests assert exact argv
+  ordering and don't rely on global `spawn` mocking.
+- **Permission errors reading `.codegraph/`** (EACCES, etc.) now surface the
+  real message instead of redirecting to `/codegraph init` (which would fail
+  the same way and loop).
+
+## 1.0.3 — 2026-06-26
+
+New manual sync command.
+
+### Added
+- **`/codegraph sync` slash command.** Force a sync of the existing
+  `.codegraph` index against the current source tree, on demand. Unlike the
+  startup gate (which also inits / rebuilds), this is sync-only: it never
+  creates or rebuilds an index. If no `.codegraph/` exists, it points you at
+  `/codegraph init` instead of silently bootstrapping one. Added to
+  tab-completion and the status-panel help text.
+
 ## 1.0.2 — 2026-06-26
 
 Status-bar polish release.

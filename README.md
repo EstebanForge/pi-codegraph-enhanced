@@ -79,10 +79,11 @@ Inspect and toggle the CodeGraph settings flag without leaving Pi.
 | `/codegraph` (TUI) | Opens an interactive settings menu (the same `SettingsList` component `/settings` uses). Flip the flag, then a single reload fires on close to apply it. |
 | `/codegraph` (non-TUI / RPC) | Falls back to a read-only status panel: the flag's on/off state and the last startup action. |
 | `/codegraph init` | Index the current folder now, regardless of the flag. Creates/syncs/rebuilds the `.codegraph` index on demand. |
+| `/codegraph sync` | Refresh the existing `.codegraph` index from the current source tree now. Sync-only: never creates or rebuilds. If no index exists, it points you at `/codegraph init`. |
 | `/codegraph toggle <flag>` | One-shot flip: persists, then reloads. |
 | `/codegraph <flag>` | Shorthand one-shot toggle (flag name without the `toggle` keyword). |
 
-Tab-completion is offered for `init`, `toggle`, and the flag name.
+Tab-completion is offered for `init`, `sync`, `toggle`, and the flag name.
 
 The one flag today:
 

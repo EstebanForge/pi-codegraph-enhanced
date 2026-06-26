@@ -26,12 +26,17 @@ const FLAGS = [
 
 export const codegraphFlagNames = FLAGS.map((f) => f.name);
 
-/** Records the most recent startup action for the /codegraph status panel. */
-export let lastStartupAction: CodeGraphStartupAction | undefined;
+/**
+ * Records the most recent index action (startup gate or manual command) for
+ * the /codegraph status panel. Carries a `source` so the panel can distinguish
+ * "last startup: synced" from "last manual sync: busy" — otherwise a transient
+ * manual lock would overwrite a clean startup record and mislead the user.
+ */
+export let lastIndexAction: CodeGraphIndexAction | undefined;
 
-/** Test-only seam to inject a startup action for status rendering. */
-export function setLastStartupActionForTest(action: CodeGraphStartupAction | undefined): void {
-  lastStartupAction = action;
+/** Test-only seam to inject an index action for status rendering. */
+export function setLastIndexActionForTest(action: CodeGraphIndexAction | undefined): void {
+  lastIndexAction = action;
 }
 
 const OptionalProjectPath = Type.Optional(Type.String({
@@ -334,6 +339,15 @@ export type CodeGraphStartupAction =
   | { action: "skipped"; projectPath: string }
   | { action: "unavailable"; projectPath: string }
   | { action: "busy"; projectPath: string };
+
+/**
+ * A recorded index action, tagged with whether it came from the startup gate
+ * or a manual `/codegraph init` / `/codegraph sync`. The display uses `source`
+ * to avoid a manual command silently overwriting the startup record.
+ */
+export type CodeGraphIndexAction = CodeGraphStartupAction & {
+  source: "startup" | "manual";
+};
 
 /**
  * Dedups overlapping ensureCodeGraphIndex calls against the same project within
@@ -729,7 +743,7 @@ export async function callCodeGraphTool(
  * error so a TUI glitch can't reject the fire-and-forget chain.
  */
 function reportStartupAction(result: CodeGraphStartupAction, ctx: ExtensionContext): void {
-  lastStartupAction = result;
+  lastIndexAction = { ...result, source: "startup" };
   if (!ctx.hasUI) return;
   const ui = ctx.ui;
   switch (result.action) {
@@ -760,9 +774,9 @@ export function renderCodeGraphStatus(pi: ExtensionAPI): string {
   const flagLines = FLAGS.map(
     (f) => `  ${pi.getFlag(f.name) === false ? "[ ]" : "[x]"} ${f.name}  — ${f.description}`,
   );
-  const action = lastStartupAction
-    ? `last startup action: ${lastStartupAction.action}`
-    : "last startup action: (none yet this session)";
+  const action = lastIndexAction
+    ? `last index action: ${lastIndexAction.source} ${lastIndexAction.action} (${lastIndexAction.projectPath})`
+    : "last index action: (none yet this session)";
   return [
     "CodeGraph settings",
     "",
@@ -773,6 +787,7 @@ export function renderCodeGraphStatus(pi: ExtensionAPI): string {
     "",
     "toggle: /codegraph toggle <flag>   (shorthand: /codegraph <flag>)",
     "init:   /codegraph init            (index this folder now, ignoring the flag)",
+    "sync:   /codegraph sync            (refresh the existing index from source now)",
     "also:   pi config set <flag> false",
   ].join("\n");
 }
@@ -802,7 +817,7 @@ export function runManualInit(ctx: ExtensionContext): void {
 
   ensureCodeGraphIndexOnce(projectPath)
     .then((result) => {
-      lastStartupAction = result;
+      lastIndexAction = { ...result, source: "manual" };
       if (!ui) return;
       safe(() => {
         switch (result.action) {
@@ -840,6 +855,167 @@ export function runManualInit(ctx: ExtensionContext): void {
         ui.notify("CodeGraph: init failed", "error");
       });
     });
+}
+
+/**
+ * `/codegraph sync` — force a sync of the existing `.codegraph/` index in
+ * `cwd` against the current source tree, on demand. Unlike the startup gate
+ * (ensureCodeGraphIndex), this never inits or rebuilds: it is the explicit
+ * "refresh what's already indexed" path. Fire-and-forget; notifies the
+ * outcome. Requires an existing index — if none is present, the user is pointed
+ * at `/codegraph init` instead of silently creating one.
+ *
+ * Failure handling is deliberately distinct (not collapsed into one "busy"
+ * bucket): a lock conflict or timeout reports `busy` with the unlock hint,
+ * while a corrupt/unreadable index (`status` fails / `initialized:false`) or a
+ * non-zero sync exit surfaces a dedicated message pointing at `/codegraph init`.
+ * `runner` is injectable for tests; every other CLI entry point takes one too.
+ */
+export function runManualSync(
+  ctx: ExtensionContext,
+  runner: CodeGraphRunner = defaultCodeGraphRunner,
+): void {
+  const projectPath = ctx.cwd ?? process.cwd();
+  const ui = ctx.hasUI ? ctx.ui : undefined;
+  // A TUI glitch must never reject this fire-and-forget chain.
+  const safe = (fn: () => void): void => {
+    try {
+      fn();
+    } catch {
+      /* swallow */
+    }
+  };
+
+  const record = (action: CodeGraphStartupAction["action"]): void => {
+    lastIndexAction = { action, projectPath, source: "manual" };
+  };
+
+  if (ui) safe(() => ui.setStatus("codegraph", "🔍 CodeGraph: syncing…"));
+
+  (async () => {
+    // Fail fast if the CLI is absent: never report a false "synced" from a
+    // spawn ENOENT, and don't burn the full startup timeout window.
+    const probe = await runWithTimeout(
+      runner,
+      ["--version"],
+      projectPath,
+      "version",
+      VersionProbeTimeoutMs,
+    );
+    if (probe.code !== 0) {
+      record("unavailable");
+      if (!ui) return;
+      safe(() => {
+        ui.setStatus("codegraph", undefined);
+        ui.notify(
+          "CodeGraph unavailable; sync aborted. Install the codegraph CLI and ensure it's on PATH (`npm i -g @colbymchenry/codegraph`).",
+          "warning",
+        );
+      });
+      return;
+    }
+
+    // sync only makes sense against an existing index. Distinguish a genuinely
+    // missing index (ENOENT / not-a-directory → redirect to init) from a
+    // permission or I/O error (surface the real message, since init would fail
+    // the same way and loop).
+    try {
+      const info = await stat(path.join(projectPath, CodegraphDir));
+      if (!info.isDirectory()) throw new Error("not a directory");
+    } catch (err: any) {
+      const missing = err?.code === "ENOENT" || err?.message === "not a directory";
+      if (!missing) {
+        if (ui) safe(() => {
+          ui.setStatus("codegraph", undefined);
+          ui.notify(`Cannot read .codegraph/: ${err?.message ?? err}`, "error");
+        });
+        return;
+      }
+      if (!ui) return;
+      safe(() => {
+        ui.setStatus("codegraph", undefined);
+        ui.notify(
+          `No .codegraph index in ${projectPath}. Run /codegraph init first.`,
+          "warning",
+        );
+      });
+      return;
+    }
+
+    // Probe index health BEFORE attempting sync: a corrupt or uninitialized DB
+    // (initialized:false, unparseable status, or non-zero exit) makes `sync`
+    // exit non-zero, which the old code mis-reported as "busy / unlock". Report
+    // the real condition and point at init/rebuild instead.
+    const statusResult = await runWithTimeout(
+      runner,
+      ["status", "--json"],
+      projectPath,
+      "status",
+    );
+    if (statusResult.timedOut || looksLikeLockFailure(statusResult)) {
+      record("busy");
+      if (!ui) return;
+      safe(() => {
+        ui.setStatus("codegraph", "🔍 CodeGraph: index busy (run `codegraph unlock` if stuck)");
+        ui.notify(`CodeGraph: sync did not complete — index busy (${projectPath})`, "info");
+      });
+      return;
+    }
+    const status = parseStatusJson(statusResult.stdout);
+    const statusFailed =
+      statusResult.code !== 0 || status === undefined || status.initialized === false;
+    if (statusFailed) {
+      if (!ui) return;
+      safe(() => {
+        ui.setStatus("codegraph", undefined);
+        ui.notify(
+          `CodeGraph index is corrupt or unreadable in ${projectPath}. Run /codegraph init to rebuild.`,
+          "warning",
+        );
+      });
+      return;
+    }
+
+    const result = await runWithTimeout(runner, ["sync", "-q"], projectPath, "sync");
+
+    // Three distinct outcomes, not one bucket: lock/timeout = busy (unlock
+    // hint), other non-zero = genuine failure (try init), zero = synced.
+    if (result.timedOut || looksLikeLockFailure(result)) {
+      record("busy");
+      if (!ui) return;
+      safe(() => {
+        ui.setStatus("codegraph", "🔍 CodeGraph: index busy (run `codegraph unlock` if stuck)");
+        ui.notify(`CodeGraph: sync did not complete — index busy (${projectPath})`, "info");
+      });
+      return;
+    }
+    if (result.code !== 0) {
+      if (!ui) return;
+      safe(() => {
+        ui.setStatus("codegraph", undefined);
+        ui.notify(
+          `CodeGraph: sync failed (exit ${result.code}) in ${projectPath}. Try /codegraph init.`,
+          "error",
+        );
+      });
+      return;
+    }
+
+    record("synced");
+    if (!ui) return;
+    safe(() => {
+      ui.setStatus("codegraph", "🔍 CodeGraph: synced");
+      ui.notify(`CodeGraph: synced (${projectPath})`, "info");
+    });
+  })().catch(() => {
+    // Never leave a stale "syncing…" status after a silent failure, and never
+    // re-throw out of .catch (would be an unhandled rejection).
+    if (!ui) return;
+    safe(() => {
+      ui.setStatus("codegraph", undefined);
+      ui.notify("CodeGraph: sync failed", "error");
+    });
+  });
 }
 
 export default function codegraphExtension(pi: ExtensionAPI): void {
@@ -881,12 +1057,12 @@ export default function codegraphExtension(pi: ExtensionAPI): void {
   // the in-memory value picks up the change. ctx is stale after reload() —
   // we notify first, reload last, and return immediately.
   pi.registerCommand("codegraph", {
-    description: "CodeGraph: show settings, init the index now, or toggle a flag. Usage: /codegraph [init | toggle <flag>]",
+    description: "CodeGraph: show settings, init or sync the index now, or toggle a flag. Usage: /codegraph [init | sync | toggle <flag>]",
     getArgumentCompletions: (prefix: string) => {
       const trailingSpace = /\s$/.test(prefix);
       const tokens = prefix.trim().split(/\s+/).filter(Boolean);
       const flagNames = FLAGS.map((f) => f.name);
-      const root = ["init", "toggle", ...flagNames];
+      const root = ["init", "sync", "toggle", ...flagNames];
       const toggleComplete =
         (tokens.length === 1 && tokens[0] === "toggle") ||
         (tokens.length >= 2 && tokens[0] === "toggle");
@@ -911,6 +1087,16 @@ export default function codegraphExtension(pi: ExtensionAPI): void {
       // notify of the outcome so the user knows what happened.
       if (trimmed === "init") {
         runManualInit(ctx);
+        return;
+      }
+
+      // /codegraph sync — refresh the existing .codegraph index in the current
+      // project on demand, regardless of the codegraph-auto-index flag. This is
+      // the explicit "pull source changes into the index" path for users who
+      // want a fresh sync without waiting for the startup gate. Fire-and-forget,
+      // with a notify of the outcome so the user knows what happened.
+      if (trimmed === "sync") {
+        runManualSync(ctx);
         return;
       }
 
