@@ -736,10 +736,10 @@ function reportStartupAction(result: CodeGraphStartupAction, ctx: ExtensionConte
     case "initialized":
     case "rebuilt":
     case "synced":
-      ui.setStatus("codegraph", `CodeGraph: ${result.action}`);
+      ui.setStatus("codegraph", `🔍 CodeGraph: ${result.action}`);
       break;
     case "busy":
-      ui.setStatus("codegraph", "CodeGraph: index busy (run `codegraph unlock` if stuck)");
+      ui.setStatus("codegraph", "🔍 CodeGraph: index busy (run `codegraph unlock` if stuck)");
       break;
     case "unavailable":
       // The most actionable signal: warn once that auto-index is off.
@@ -798,7 +798,7 @@ export function runManualInit(ctx: ExtensionContext): void {
   // Status-bar-only start signal: persists as the in-flight indicator without
   // adding a toast (the completion toast closes the loop). Skipped entirely in
   // headless/print mode, where ctx.hasUI is false.
-  if (ui) safe(() => ui.setStatus("codegraph", "CodeGraph: indexing…"));
+  if (ui) safe(() => ui.setStatus("codegraph", "🔍 CodeGraph: indexing…"));
 
   ensureCodeGraphIndexOnce(projectPath)
     .then((result) => {
@@ -809,11 +809,11 @@ export function runManualInit(ctx: ExtensionContext): void {
           case "initialized":
           case "rebuilt":
           case "synced":
-            ui.setStatus("codegraph", `CodeGraph: ${result.action}`);
+            ui.setStatus("codegraph", `🔍 CodeGraph: ${result.action}`);
             ui.notify(`CodeGraph: ${result.action} (${projectPath})`, "info");
             break;
           case "busy":
-            ui.setStatus("codegraph", "CodeGraph: index busy (run `codegraph unlock` if stuck)");
+            ui.setStatus("codegraph", "🔍 CodeGraph: index busy (run `codegraph unlock` if stuck)");
             ui.notify(`CodeGraph: busy (${projectPath})`, "info");
             break;
           case "unavailable":

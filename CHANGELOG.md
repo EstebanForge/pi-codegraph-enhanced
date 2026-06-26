@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.2 — 2026-06-26
+
+Status-bar polish release.
+
+### Changed
+- **Status-bar line now carries a `🔍` prefix.** Mirrors the
+  `@estebanforge/pi-agentmemory` convention (`🧠 agentmemory`): every visible
+  `CodeGraph: <state>` status line is prefixed with a magnifying glass, evoking
+  the extension's purpose (agents taking a closer look at the codebase). The
+  icon appears on all present states (`indexing…`, `initialized`, `rebuilt`,
+  `synced`, `index busy`); the line is still cleared entirely on the
+  unavailable / already-up-to-date / failure paths, so no orphan icon remains.
+
 ## 1.0.1 — 2026-06-25
 
 Bugfix release for the `/codegraph init` command.

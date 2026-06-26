@@ -1,6 +1,6 @@
 {
   "name": "@estebanforge/pi-codegraph-enhanced",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Pi-native CodeGraph tools with startup auto-indexing. Fork of @vndv/pi-codegraph that adds automatic index init/resync on every session start: creates the index when missing, incrementally syncs drift, rebuilds on corruption, and skips cleanly when another process holds the lock or the CLI is absent. Same eight codegraph_* tools (search, node, files, callers, callees, impact, explore, status) proxying CodeGraph's MCP server, now with a cancellable, Windows-aware CLI runner and user-visible status feedback.",
   "keywords": [
     "pi-package",
