@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.5 — 2026-07-21
+
+### Fixed
+- **Flag toggles no longer crash.** `/codegraph <flag>` and the `/codegraph`
+  menu both tried to persist via `pi config set`, which is not a real command
+  (`pi config` only accepts `-l/--approve/--no-approve`; any positional arg
+  throws "Unexpected argument" and exits 1). Every toggle failed with
+  `Failed to apply: <flag>`.
+  - Flags now persist to a file-backed store (`<piDir>/pi-codegraph-enhanced.json`,
+    `piDir = PI_CODING_AGENT_DIR || ~/.pi/agent`), seeded into `registerFlag`
+    at load. `pi config set` is gone; toggles call `saveFlagSetting` then
+    `/reload` (the reload re-seeds the flag from disk).
+  - Settings now survive a full pi restart too — the old mechanism never
+    persisted at all (extension flags are in-memory only; there is no CLI for
+    them).
+
 ## 1.0.4 — 2026-06-26
 
 Hardening of `/codegraph sync` after peer review (six findings addressed).

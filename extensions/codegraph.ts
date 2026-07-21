@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -25,6 +26,68 @@ const FLAGS = [
 ];
 
 export const codegraphFlagNames = FLAGS.map((f) => f.name);
+
+// ── File-backed flag persistence ─────────────────────────────────────────────
+// pi's extension flags (pi.registerFlag) are in-memory only: seeded from
+// `default` and CLI `--flag` args at process start. There is no setFlag on
+// ExtensionAPI, and `pi config set <flag>` is not a real command (pi config
+// only accepts -l/--approve/--no-approve; any positional arg throws). So flag
+// settings persist in our own file at <piDir>/pi-codegraph-enhanced.json as a
+// { "<flagName>": bool } map. It is read at factory load to seed each
+// registerFlag default, and written through on every toggle; the subsequent
+// ctx.reload() re-runs the factory, which re-seeds the defaults from disk —
+// that re-seed is the apply path (the current handler keeps running in the
+// pre-reload frame, so we notify first, reload last, and return). `piDir`
+// resolves the same way pi does (dist/config.js getAgentDir): the env override
+// wins, else ~/.pi/agent.
+const FLAG_SETTINGS_FILENAME = "pi-codegraph-enhanced.json";
+
+function getPiDir(): string {
+  const envDir = process.env.PI_CODING_AGENT_DIR;
+  if (envDir) return envDir;
+  return path.join(os.homedir(), ".pi", "agent");
+}
+
+function getFlagSettingsPath(): string {
+  return path.join(getPiDir(), FLAG_SETTINGS_FILENAME);
+}
+
+/**
+ * Read the persisted flag map. Missing or corrupt file → {} (flags fall back
+ * to their built-in default of false).
+ */
+function loadFlagSettings(): Record<string, boolean> {
+  try {
+    const p = getFlagSettingsPath();
+    if (!existsSync(p)) return {};
+    const parsed = JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>;
+    const out: Record<string, boolean> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v === "boolean") out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Merge one flag value into the settings file and write it back. Creates the
+ * piDir if missing. Returns true on success; false means the disk write failed
+ * (permissions, read-only fs) and the caller should report an error. The next
+ * loadFlagSettings() reflects the new value immediately.
+ */
+function saveFlagSetting(name: string, value: boolean): boolean {
+  try {
+    const dir = getPiDir();
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const merged = { ...loadFlagSettings(), [name]: value };
+    writeFileSync(getFlagSettingsPath(), JSON.stringify(merged, null, 2) + "\n", "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Records the most recent index action (startup gate or manual command) for
@@ -788,7 +851,6 @@ export function renderCodeGraphStatus(pi: ExtensionAPI): string {
     "toggle: /codegraph toggle <flag>   (shorthand: /codegraph <flag>)",
     "init:   /codegraph init            (index this folder now, ignoring the flag)",
     "sync:   /codegraph sync            (refresh the existing index from source now)",
-    "also:   pi config set <flag> false",
   ].join("\n");
 }
 
@@ -1021,9 +1083,17 @@ export function runManualSync(
 export default function codegraphExtension(pi: ExtensionAPI): void {
   // Register flags at factory load time, NOT inside a session hook.
   // registerFlag is static setup; calling it per session would clobber user
-  // preferences on every /new or /reload.
+  // preferences on every /new or /reload. The default is seeded from the
+  // persisted flag settings file (if present) so toggles survive restarts;
+  // otherwise the built-in default of false applies.
+  const flagSettings = loadFlagSettings();
   for (const f of FLAGS) {
-    pi.registerFlag(f.name, { description: f.description, type: "boolean", default: false });
+    const persisted = flagSettings[f.name];
+    pi.registerFlag(f.name, {
+      description: f.description,
+      type: "boolean",
+      default: typeof persisted === "boolean" ? persisted : false,
+    });
   }
 
   pi.on("resources_discover", async (event, ctx) => {
@@ -1053,9 +1123,11 @@ export default function codegraphExtension(pi: ExtensionAPI): void {
   // /codegraph — status display by default; `toggle <flag>` (or bare
   // `<flag>`) flips a boolean. In TUI, bare /codegraph opens an interactive
   // SettingsList menu (same component /settings uses). ExtensionAPI exposes
-  // no live setFlag, so a toggle persists via `pi config set` and reloads so
-  // the in-memory value picks up the change. ctx is stale after reload() —
-  // we notify first, reload last, and return immediately.
+  // no live setFlag, so a toggle writes through to the flag settings file
+  // (<piDir>/pi-codegraph-enhanced.json) and reloads; the factory re-seeds
+  // registerFlag defaults from disk, so the in-memory value picks up the
+  // change. ctx is stale after reload() — we notify first, reload last, and
+  // return immediately.
   pi.registerCommand("codegraph", {
     description: "CodeGraph: show settings, init or sync the index now, or toggle a flag. Usage: /codegraph [init | sync | toggle <flag>]",
     getArgumentCompletions: (prefix: string) => {
@@ -1115,12 +1187,8 @@ export default function codegraphExtension(pi: ExtensionAPI): void {
         }
         const current = pi.getFlag(meta.name) === true;
         const next = !current;
-        const result = await pi.exec("pi", ["config", "set", meta.name, String(next)]);
-        if (result.code !== 0) {
-          ctx.ui.notify(
-            `Failed to set ${meta.name}: ${result.stderr.trim() || `exit ${result.code}`}`,
-            "error",
-          );
+        if (!saveFlagSetting(meta.name, next)) {
+          ctx.ui.notify(`Failed to set ${meta.name}: could not write settings file`, "error");
           return;
         }
         ctx.ui.notify(`${meta.name}: ${current} → ${next}. Reloading...`, "info");
@@ -1129,9 +1197,9 @@ export default function codegraphExtension(pi: ExtensionAPI): void {
       }
 
       // Status/menu mode. In TUI, open an interactive SettingsList so the
-      // user can flip flags in one visit; changes persist via `pi config set`
-      // and a single reload fires on close. Outside TUI, fall back to the
-      // read-only status panel — custom components are terminal-only.
+      // user can flip flags in one visit; changes persist via the flag
+      // settings file and a single reload fires on close. Outside TUI, fall
+      // back to the read-only status panel — custom components are terminal-only.
       if (ctx.mode !== "tui") {
         ctx.ui.notify(renderCodeGraphStatus(pi), "info");
         return;
@@ -1180,8 +1248,7 @@ export default function codegraphExtension(pi: ExtensionAPI): void {
 
       const failures: string[] = [];
       for (const [name, val] of deltas) {
-        const r = await pi.exec("pi", ["config", "set", name, String(val)]);
-        if (r.code !== 0) failures.push(`${name} (${r.stderr.trim() || `exit ${r.code}`})`);
+        if (!saveFlagSetting(name, val)) failures.push(name);
       }
       if (failures.length > 0) {
         ctx.ui.notify(`Failed to apply: ${failures.join("; ")}`, "error");
