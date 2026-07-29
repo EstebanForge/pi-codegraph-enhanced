@@ -23,7 +23,15 @@
     "type": "git",
     "url": "git+https://github.com/EstebanForge/pi-codegraph-enhanced.git"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
   "files": [
     "extensions",
     "README.md"
